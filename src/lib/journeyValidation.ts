@@ -1,0 +1,133 @@
+import type { Edge, Node } from "@xyflow/react";
+import type { JourneyNodeData } from "@/lib/journeySchema";
+import { simulateJourney } from "@/lib/simulateJourney";
+
+export type JourneyValidationResult = {
+  /** True when there are no global issues and every node has zero messages. */
+  isValid: boolean;
+  /** Validation messages per node id. */
+  byNode: Record<string, string[]>;
+  /** Journey-level issues (structure, path, etc.). */
+  global: string[];
+};
+
+function add(map: Record<string, string[]>, id: string, message: string) {
+  if (!map[id]) map[id] = [];
+  map[id].push(message);
+}
+
+/**
+ * Validates journey structure, unique labels, required fields per node type,
+ * reachability from Start, and a complete path from Start to End.
+ */
+export function validateJourney(
+  nodes: Node<JourneyNodeData>[],
+  edges: Edge[],
+): JourneyValidationResult {
+  const byNode: Record<string, string[]> = {};
+  const global: string[] = [];
+
+  const starts = nodes.filter((n) => n.type === "start");
+  const ends = nodes.filter((n) => n.type === "end");
+
+  if (starts.length === 0) {
+    global.push("Add exactly one Start node.");
+  }
+  if (starts.length > 1) {
+    global.push("Only one Start node is allowed.");
+    for (const s of starts) {
+      add(byNode, s.id, "Journey must have a single Start node.");
+    }
+  }
+
+  if (ends.length === 0) {
+    global.push("Add exactly one End node.");
+  }
+  if (ends.length > 1) {
+    global.push("Only one End node is allowed.");
+    for (const e of ends) {
+      add(byNode, e.id, "Journey must have a single End node.");
+    }
+  }
+
+  const labelToIds = new Map<string, string[]>();
+  for (const n of nodes) {
+    const t = String(n.data.label ?? "")
+      .trim()
+      .toLowerCase();
+    if (!t) continue;
+    if (!labelToIds.has(t)) labelToIds.set(t, []);
+    labelToIds.get(t)!.push(n.id);
+  }
+  for (const [, ids] of labelToIds) {
+    if (ids.length > 1) {
+      const msg = "Duplicate label — each node must have a unique name.";
+      for (const id of ids) add(byNode, id, msg);
+    }
+  }
+
+  for (const n of nodes) {
+    const label = String(n.data.label ?? "").trim();
+    if (!label) {
+      add(byNode, n.id, "Label is required.");
+    }
+
+    switch (n.type) {
+      case "audience":
+        if (!String(n.data.segmentHint ?? "").trim()) {
+          add(byNode, n.id, "Segment hint is required.");
+        }
+        break;
+      case "event":
+        if (!String(n.data.eventKey ?? "").trim()) {
+          add(byNode, n.id, "Event key is required.");
+        }
+        break;
+      case "email":
+        if (!String(n.data.templateName ?? "").trim()) {
+          add(byNode, n.id, "Template name is required.");
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (starts.length === 1) {
+    const startId = starts[0]!.id;
+    const reachable = new Set<string>();
+    const adj = new Map<string, string[]>();
+    for (const e of edges) {
+      if (!adj.has(e.source)) adj.set(e.source, []);
+      adj.get(e.source)!.push(e.target);
+    }
+    reachable.add(startId);
+    const stack = [startId];
+    while (stack.length) {
+      const id = stack.pop()!;
+      for (const t of adj.get(id) ?? []) {
+        if (!reachable.has(t)) {
+          reachable.add(t);
+          stack.push(t);
+        }
+      }
+    }
+    for (const n of nodes) {
+      if (!reachable.has(n.id)) {
+        add(byNode, n.id, "Not reachable from Start — connect this node.");
+      }
+    }
+  }
+
+  if (starts.length === 1 && ends.length === 1) {
+    const sim = simulateJourney(nodes, edges);
+    if (!sim.ok) {
+      global.push(sim.error);
+    }
+  }
+
+  const hasNodeIssue = nodes.some((n) => (byNode[n.id]?.length ?? 0) > 0);
+  const isValid = global.length === 0 && !hasNodeIssue;
+
+  return { isValid, byNode, global };
+}
