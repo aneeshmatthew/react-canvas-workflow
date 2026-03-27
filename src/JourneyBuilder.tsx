@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -25,6 +26,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { ExecutionDryRunModal } from "@/components/ExecutionDryRunModal";
 import { Inspector } from "@/components/Inspector";
+import { InspectorLeavePrompt } from "@/components/InspectorLeavePrompt";
 import { PanelResizeHandle } from "@/components/PanelResizeHandle";
 import {
   AudienceNode,
@@ -166,6 +168,33 @@ function FlowCanvas({
     fitView,
   } = useReactFlow();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [inspectorNavPrompt, setInspectorNavPrompt] = useState<{
+    nextId: string | null;
+    fromNodeId: string;
+  } | null>(null);
+
+  const nodesRef = useRef(nodes);
+  const edgesRef = useRef(edges);
+  nodesRef.current = nodes;
+  edgesRef.current = edges;
+  const selectedIdRef = useRef<string | null>(null);
+  const inspectorBaselineRef = useRef<string | null>(null);
+  const inspectorPromptOpenRef = useRef(false);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+  useEffect(() => {
+    inspectorPromptOpenRef.current = inspectorNavPrompt !== null;
+  }, [inspectorNavPrompt]);
+  useLayoutEffect(() => {
+    if (!selectedId) {
+      inspectorBaselineRef.current = null;
+      return;
+    }
+    const n = nodesRef.current.find((x) => x.id === selectedId);
+    if (n) inspectorBaselineRef.current = JSON.stringify(n.data);
+  }, [selectedId]);
 
   const selected = nodes.find((n) => n.id === selectedId) ?? null;
   const [viewTick, setViewTick] = useState(0);
@@ -220,6 +249,19 @@ function FlowCanvas({
   const validation = useMemo(
     () => validateJourney(nodes, edges),
     [nodes, edges],
+  );
+
+  const needsInspectorLeavePrompt = useCallback(
+    (nodeId: string) => {
+      const n = nodesRef.current.find((x) => x.id === nodeId);
+      if (!n) return false;
+      const baseline = inspectorBaselineRef.current;
+      if (!baseline) return false;
+      const dirty = JSON.stringify(n.data) !== baseline;
+      const hasVal = (validation.byNode[nodeId]?.length ?? 0) > 0;
+      return dirty || hasVal;
+    },
+    [validation],
   );
 
   useEffect(() => {
@@ -319,15 +361,21 @@ function FlowCanvas({
     [setNodes],
   );
 
-  const closeInspector = useCallback(() => {
+  const requestCloseInspector = useCallback(() => {
+    const prevId = selectedIdRef.current;
+    if (!prevId) return;
+    if (needsInspectorLeavePrompt(prevId)) {
+      setInspectorNavPrompt({ nextId: null, fromNodeId: prevId });
+      return;
+    }
     setSelectedId(null);
     setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
-  }, [setNodes]);
+  }, [needsInspectorLeavePrompt, setNodes]);
 
   const saveJourneyToStorage = useCallback(() => {
     const doc = toJourneyDocument(
-      nodes,
-      edges,
+      nodesRef.current,
+      edgesRef.current,
       {
         name: journeyName,
         updatedAt: new Date().toISOString(),
@@ -335,7 +383,85 @@ function FlowCanvas({
       getViewport(),
     );
     saveToLocalStorage(doc);
-  }, [nodes, edges, journeyName, getViewport]);
+  }, [journeyName, getViewport]);
+
+  const saveJourneyToStorageAndBaseline = useCallback(() => {
+    saveJourneyToStorage();
+    const sid = selectedIdRef.current;
+    if (sid) {
+      const n = nodesRef.current.find((x) => x.id === sid);
+      if (n) inspectorBaselineRef.current = JSON.stringify(n.data);
+    }
+  }, [saveJourneyToStorage]);
+
+  const handleInspectorSaveAndClose = useCallback(() => {
+    saveJourneyToStorageAndBaseline();
+    setSelectedId(null);
+    setNodes((nds) => nds.map((n) => ({ ...n, selected: false })));
+  }, [saveJourneyToStorageAndBaseline, setNodes]);
+
+  const handleInspectorPromptSave = useCallback(() => {
+    if (!inspectorNavPrompt) return;
+    const { fromNodeId, nextId } = inspectorNavPrompt;
+    saveJourneyToStorage();
+    const n = nodesRef.current.find((x) => x.id === fromNodeId);
+    if (n) inspectorBaselineRef.current = JSON.stringify(n.data);
+    setInspectorNavPrompt(null);
+    setSelectedId(nextId);
+    setNodes((nds) =>
+      nds.map((n) => ({
+        ...n,
+        selected: nextId ? n.id === nextId : false,
+      })),
+    );
+  }, [inspectorNavPrompt, saveJourneyToStorage, setNodes]);
+
+  const handleInspectorPromptDiscard = useCallback(() => {
+    if (!inspectorNavPrompt) return;
+    const { fromNodeId, nextId } = inspectorNavPrompt;
+    const baseline = inspectorBaselineRef.current;
+    setNodes((nds) => {
+      const current = nds.find((x) => x.id === fromNodeId);
+      let mapped = nds;
+      if (current && baseline) {
+        const dirty = JSON.stringify(current.data) !== baseline;
+        if (dirty) {
+          const reverted = JSON.parse(baseline) as JourneyNodeData;
+          mapped = nds.map((x) =>
+            x.id === fromNodeId ? { ...x, data: reverted } : x,
+          );
+        }
+      }
+      return mapped.map((n) => ({
+        ...n,
+        selected: nextId ? n.id === nextId : false,
+      }));
+    });
+    setInspectorNavPrompt(null);
+    setSelectedId(nextId);
+  }, [inspectorNavPrompt, setNodes]);
+
+  const handleInspectorPromptCancel = useCallback(() => {
+    setInspectorNavPrompt(null);
+  }, []);
+
+  const onSelectionChange = useCallback(
+    ({ nodes: sel }: { nodes: Node<JourneyNodeData>[] }) => {
+      if (inspectorPromptOpenRef.current) return;
+      const nextId = sel[0]?.id ?? null;
+      const prevId = selectedIdRef.current;
+      if (prevId === nextId) return;
+      if (prevId && needsInspectorLeavePrompt(prevId)) {
+        setInspectorNavPrompt({ nextId, fromNodeId: prevId });
+        setNodes((nds) =>
+          nds.map((n) => ({ ...n, selected: n.id === prevId })),
+        );
+        return;
+      }
+      setSelectedId(nextId);
+    },
+    [needsInspectorLeavePrompt, setNodes],
+  );
 
   const exportFile = () => {
     if (!validation.isValid) {
@@ -415,6 +541,20 @@ function FlowCanvas({
       "journey";
     downloadJson(`${safe}-publish.json`, serializePublishBundle(bundle));
   };
+
+  const fromId = inspectorNavPrompt?.fromNodeId;
+  const nodeForPrompt = fromId
+    ? nodes.find((n) => n.id === fromId)
+    : undefined;
+  const baselineStr = inspectorBaselineRef.current;
+  const inspectorPromptDirty = Boolean(
+    nodeForPrompt &&
+      baselineStr &&
+      JSON.stringify(nodeForPrompt.data) !== baselineStr,
+  );
+  const inspectorPromptHasVal = Boolean(
+    fromId && (validation.byNode[fromId]?.length ?? 0) > 0,
+  );
 
   return (
     <JourneyValidationProvider value={validation}>
@@ -538,6 +678,14 @@ function FlowCanvas({
         steps={dryRunModal?.steps ?? []}
         warnings={dryRunModal?.warnings ?? []}
       />
+      <InspectorLeavePrompt
+        open={inspectorNavPrompt !== null}
+        hasUnsavedEdits={inspectorPromptDirty}
+        hasValidationIssues={inspectorPromptHasVal}
+        onSave={handleInspectorPromptSave}
+        onDiscard={handleInspectorPromptDiscard}
+        onCancel={handleInspectorPromptCancel}
+      />
       <div className="app-body">
         <Palette width={paletteWidth} />
         <PanelResizeHandle
@@ -557,9 +705,7 @@ function FlowCanvas({
             onDrop={onDrop}
             onDragOver={onDragOver}
             nodeTypes={nodeTypes}
-            onSelectionChange={({ nodes: sel }) =>
-              setSelectedId(sel[0]?.id ?? null)
-            }
+            onSelectionChange={onSelectionChange}
             fitView
             minZoom={0.08}
             maxZoom={2.5}
@@ -589,8 +735,8 @@ function FlowCanvas({
               validationMessages={
                 validation.byNode[selected.id] ?? []
               }
-              onClose={closeInspector}
-              onSave={saveJourneyToStorage}
+              onClose={requestCloseInspector}
+              onSave={handleInspectorSaveAndClose}
               panelWidth={inspectorWidth}
             />
           </>
